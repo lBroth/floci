@@ -165,6 +165,19 @@ Pass `ApplicationConfiguration.ApplicationSnapshotConfiguration.SnapshotsEnabled
 `UpdateApplication`) to disable snapshots for an application — real AWS defaults this to `true`.
 `CreateApplicationSnapshot` rejects the request with `InvalidRequestException` while disabled.
 
+### Restarts
+
+Floci removes every application's Flink cluster when it shuts down. With persistent storage, each
+application that was `RUNNING`, or still `STARTING`, goes back to `STARTING` when Floci starts again,
+and its cluster starts in the background, so Floci reports itself ready without waiting for it. A
+cluster that outlived Floci, as when Floci is killed rather than shut down, is kept when its
+JobManager, its TaskManager and its job are still running, so the job carries on with its state.
+Otherwise the application gets a new cluster, as `StartApplication` starts one: its code is read from
+S3 again, in the application's account, its job is submitted afresh rather than restored from a
+snapshot, and the application turns `RUNNING` once the job runs. Its snapshots stay in their volume.
+An application whose cluster can't be started goes back to `READY`, from which `StartApplication`
+starts it again, and a `READY` application stays as it is.
+
 ### CloudWatch Logs format
 
 The JobManager and TaskManager are started with a `log4j-console.properties` that makes every log

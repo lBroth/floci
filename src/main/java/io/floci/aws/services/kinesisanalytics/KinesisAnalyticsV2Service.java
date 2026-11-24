@@ -7,9 +7,11 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.kinesisanalytics.container.FlinkContainerManager;
@@ -30,6 +32,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -69,6 +74,12 @@ public class KinesisAnalyticsV2Service implements StoredResourceArns {
     private final RegionResolver regionResolver;
     private final FlinkContainerManager containerManager;
     private final ScheduledExecutorService poller = Executors.newSingleThreadScheduledExecutor();
+    /**
+     * The applications a restore is bringing back, by {@code account:key}, which the readiness poller leaves alone:
+     * their records still name the old cluster until the restore keeps it or starts a new one. In memory only, so
+     * after a crash the record keeps what the next start probes a surviving cluster on.
+     */
+    private final Set<String> restoringApplications = ConcurrentHashMap.newKeySet();
 
     @Inject
     public KinesisAnalyticsV2Service(StorageFactory storageFactory, EmulatorConfig config,
@@ -721,46 +732,158 @@ public class KinesisAnalyticsV2Service implements StoredResourceArns {
                         "No application found for ARN: " + resourceArn, 400));
     }
 
-    private void startReadinessPoller() {
-        poller.scheduleAtFixedRate(() -> {
-            try {
-                if (config.services().kinesisAnalytics().mock()) {
-                    return;
-                }
-                for (FlinkApplication app : allApplications()) {
-                    boolean changed = false;
-                    if (app.getApplicationStatus() == ApplicationStatus.STARTING) {
-                        String previousJobId = app.getFlinkJobId();
-                        if (containerManager.advanceToRunning(app)) {
-                            LOG.infov("Kinesis Analytics V2 application {0} is now RUNNING",
-                                    app.getApplicationName());
-                            app.setApplicationStatus(ApplicationStatus.RUNNING);
-                            app.setLastUpdateTimestamp(Instant.now());
-                            changed = true;
-                        } else if (!Objects.equals(previousJobId, app.getFlinkJobId())) {
-                            // The Flink job was just submitted (flinkJobId newly assigned) but hasn't
-                            // reached RUNNING yet. Persist now rather than waiting for that: pendingJars
-                            // (an in-process-only cache) is already cleared at this point, so if the
-                            // emulator restarts before the next RUNNING-triggered persist, an unpersisted
-                            // flinkJobId would leave the application stuck — it could never re-fetch the
-                            // JAR to resubmit, nor know a job was already running to poll instead.
-                            changed = true;
-                        }
-                    }
-                    for (Snapshot snapshot : app.getSnapshots().values()) {
-                        if (snapshot.getSnapshotStatus() == SnapshotStatus.CREATING
-                                && containerManager.advanceSnapshot(app, snapshot)) {
-                            changed = true;
-                        }
-                    }
-                    if (changed) {
-                        putApplication(app);
-                    }
-                }
-            } catch (Exception e) {
-                LOG.error("Error in Kinesis Analytics V2 readiness poller", e);
+    /**
+     * Brings the persisted applications back after Floci restarts. Shutdown removes their Flink clusters
+     * ({@link FlinkContainerManager#stopAll}), so an application stored {@code RUNNING}, or still starting, has no
+     * cluster and no job. Each goes back to {@code STARTING} at once, and the clusters start in the background, so
+     * Floci does not wait for them to report itself ready; the poller leaves an application alone while its restore
+     * runs.
+     *
+     * <p>An application whose cluster outlived Floci, as when Floci is killed, keeps that cluster when it still
+     * serves the application, its job and state included. Otherwise it gets a new cluster, as
+     * {@code StartApplication} starts one, in its own account, which reads its code from S3 again, and the poller
+     * runs its job and reports it {@code RUNNING}. Like {@code StartApplication}, the job starts afresh rather than
+     * from a snapshot; the snapshots stay in their volume. An application whose cluster cannot be started is
+     * returned to {@code READY}, from which {@code StartApplication} starts it again, and a {@code READY} one is left
+     * as it is. Every application is tried, and the ones that could not be restored fail the returned future
+     * together. A shutdown during the restore leaves the applications not started yet {@code STARTING}, for the
+     * next start.
+     */
+    public CompletableFuture<Void> restorePersistedRuntime() {
+        if (config.services().kinesisAnalytics().mock()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        List<FlinkApplication> pending = new ArrayList<>();
+        for (AccountEntry<FlinkApplication> entry : persistedApplications()) {
+            FlinkApplication app = entry.value();
+            if (app.getApplicationStatus() == ApplicationStatus.READY) {
+                continue;
             }
-        }, 1, 2, TimeUnit.SECONDS);
+            if (app.getAccountId() == null) {
+                app.setAccountId(entry.accountId());
+            }
+            restoringApplications.add(restoringKey(app));
+            app.setApplicationStatus(ApplicationStatus.STARTING);
+            putApplication(app);
+            pending.add(app);
+        }
+        return CompletableFuture.runAsync(() -> {
+            RuntimeException failure = null;
+            for (FlinkApplication app : pending) {
+                if (containerManager.isShuttingDown()) {
+                    // Applications not reached yet stay starting, which the next start restores.
+                    break;
+                }
+                try {
+                    String region = regionResolver.regionOf(app.getApplicationArn());
+                    RequestScopes.runAs(app.getAccountId(), region, () -> restoreApplication(app));
+                } catch (FlinkContainerManager.ShuttingDownException e) {
+                    LOG.debugv("Kinesis Analytics V2 application {0} not restored: {1}", app.getApplicationName(),
+                            e.getMessage());
+                } catch (RuntimeException e) {
+                    RuntimeException restoreFailure = new IllegalStateException("Could not restore Kinesis "
+                            + "Analytics V2 application " + app.getApplicationName() + " of account "
+                            + app.getAccountId(), e);
+                    if (failure == null) {
+                        failure = restoreFailure;
+                    } else {
+                        failure.addSuppressed(restoreFailure);
+                    }
+                } finally {
+                    restoringApplications.remove(restoringKey(app));
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+        });
+    }
+
+    private void restoreApplication(FlinkApplication app) {
+        if (containerManager.adoptRunningCluster(app)) {
+            app.setApplicationStatus(ApplicationStatus.RUNNING);
+            app.setLastUpdateTimestamp(Instant.now());
+            putApplication(app);
+            return;
+        }
+        // The job ran on the cluster shutdown removed; the new cluster runs it again.
+        app.setFlinkJobId(null);
+        try {
+            containerManager.startCluster(app);
+        } catch (FlinkContainerManager.ShuttingDownException e) {
+            throw e;
+        } catch (RuntimeException e) {
+            containerManager.stopCluster(app);
+            app.setApplicationStatus(ApplicationStatus.READY);
+            app.setLastUpdateTimestamp(Instant.now());
+            putApplication(app);
+            throw e;
+        }
+        if (app.getApplicationStatus() != ApplicationStatus.STARTING) {
+            // Stopped while its cluster started, which the stop could not remove yet.
+            containerManager.stopCluster(app);
+        }
+        putApplication(app);
+    }
+
+    private List<AccountEntry<FlinkApplication>> persistedApplications() {
+        if (storage instanceof AccountAwareStorageBackend<FlinkApplication> aware) {
+            return aware.scanAllAccountEntries(key -> true);
+        }
+        return storage.scan(k -> true).stream()
+                .map(app -> new AccountEntry<>(app.getAccountId(), applicationKey(
+                        regionResolver.regionOf(app.getApplicationArn()), app.getApplicationName()), app))
+                .toList();
+    }
+
+    private String restoringKey(FlinkApplication app) {
+        return app.getAccountId() + ":" + app.getApplicationArn();
+    }
+
+    private void startReadinessPoller() {
+        poller.scheduleAtFixedRate(this::pollReadiness, 1, 2, TimeUnit.SECONDS);
+    }
+
+    /** One pass of the readiness poller: drives each starting application toward RUNNING, and its snapshots. */
+    void pollReadiness() {
+        try {
+            if (config.services().kinesisAnalytics().mock()) {
+                return;
+            }
+            for (FlinkApplication app : allApplications()) {
+                boolean changed = false;
+                if (app.getApplicationStatus() == ApplicationStatus.STARTING
+                        && !restoringApplications.contains(restoringKey(app))) {
+                    String previousJobId = app.getFlinkJobId();
+                    if (containerManager.advanceToRunning(app)) {
+                        LOG.infov("Kinesis Analytics V2 application {0} is now RUNNING",
+                                app.getApplicationName());
+                        app.setApplicationStatus(ApplicationStatus.RUNNING);
+                        app.setLastUpdateTimestamp(Instant.now());
+                        changed = true;
+                    } else if (!Objects.equals(previousJobId, app.getFlinkJobId())) {
+                        // The Flink job was just submitted (flinkJobId newly assigned) but hasn't
+                        // reached RUNNING yet. Persist now rather than waiting for that: pendingJars
+                        // (an in-process-only cache) is already cleared at this point, so if the
+                        // emulator restarts before the next RUNNING-triggered persist, an unpersisted
+                        // flinkJobId would leave the application stuck — it could never re-fetch the
+                        // JAR to resubmit, nor know a job was already running to poll instead.
+                        changed = true;
+                    }
+                }
+                for (Snapshot snapshot : app.getSnapshots().values()) {
+                    if (snapshot.getSnapshotStatus() == SnapshotStatus.CREATING
+                            && containerManager.advanceSnapshot(app, snapshot)) {
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    putApplication(app);
+                }
+            }
+        } catch (Exception e) {
+            LOG.error("Error in Kinesis Analytics V2 readiness poller", e);
+        }
     }
 
     private List<FlinkApplication> allApplications() {
